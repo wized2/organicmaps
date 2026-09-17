@@ -29,6 +29,18 @@ std::array<uint32_t, VulkanMemoryManager::kResourcesCount> const kDesiredSizeInB
     100 * 1024 * 1024,                     // Image
 }};
 
+// Uniform, storage and staging buffers are mapped outside of the VulkanObjectManager lock, for a frame or for
+// their whole lifetime, so their allocations never share a memory block: Vulkan forbids to map the same
+// VkDeviceMemory twice, and a shared block could be mapped by one thread while another one deallocates or
+// maps a neighbour allocation in it.
+std::array<bool, VulkanMemoryManager::kResourcesCount> const kExclusiveBlocks = {{
+    false,  // Geometry (mapped only under the lock)
+    true,   // Uniform
+    true,   // Storage
+    true,   // Staging
+    false,  // Image (never mapped)
+}};
+
 VkMemoryPropertyFlags GetMemoryPropertyFlags(VulkanMemoryManager::ResourceType resourceType,
                                              std::optional<VkMemoryPropertyFlags> & fallbackTypeBits)
 {
@@ -148,9 +160,10 @@ VulkanMemoryManager::AllocationPtr VulkanMemoryManager::Allocate(ResourceType re
 {
   size_t const intResType = static_cast<size_t>(resourceType);
   auto const alignedSize = GetAligned(static_cast<uint32_t>(memReqs.size), GetSizeAlignment(memReqs));
+  auto & m = m_memory[intResType];
   // Looking for an existed block.
+  if (!kExclusiveBlocks[intResType])
   {
-    auto & m = m_memory[intResType];
     auto const it = m.find(blockHash);
     if (it != m.end())
     {
@@ -166,8 +179,10 @@ VulkanMemoryManager::AllocationPtr VulkanMemoryManager::Allocate(ResourceType re
         return std::make_shared<Allocation>(resourceType, blockHash, alignedOffset, alignedSize, make_ref(block));
       }
     }
+  }
 
-    // Looking for a block in free ones.
+  // Looking for a block in free ones.
+  {
     auto & fm = m_freeBlocks[intResType];
     // Free blocks array must be sorted by size.
     auto const freeBlockIt = std::lower_bound(fm.begin(), fm.end(), alignedSize, LessBlockSize());
@@ -218,8 +233,6 @@ VulkanMemoryManager::AllocationPtr VulkanMemoryManager::Allocate(ResourceType re
   m_sizes[intResType] += blockSize;
 
   // Attach block.
-  auto & m = m_memory[intResType];
-
   auto newBlock = make_unique_dp<MemoryBlock>();
   newBlock->m_memory = memory;
   newBlock->m_blockSize = blockSize;
